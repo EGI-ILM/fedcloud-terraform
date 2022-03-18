@@ -1,0 +1,425 @@
+#!/bin/bash
+
+# EGI TF
+# Contact: ignacio.lamata@egi.eu
+# Requires apt-based system and Bash 4 or newer. Tested on Ubuntu 21.10
+
+# ------------------------------------------------------------------------
+# General variables
+# ------------------------------------------------------------------------
+VERSION=22MAR-03
+OPERATIONMODE=TERRAFORM
+OIDC_ACCOUNT_NAME=egi
+LOCALS_FILE_NAME=egi_images.tf
+FEDCLOUDCLI_PATH=~/.local/bin/fedcloud
+# ------------------------------------------------------------------------
+OK_VALUE=0
+ERR_INCORRECTPARAMETERS_VALUE=501
+ERR_NODATA_VALUE=502
+ERR_NOAPTSYSTEM_VALUE=503
+ERR_ENDPOINTREQ_VALUE=504
+ERR_TOKENREQ_VALUE=505
+ERR_RESOURCES_MSG="
+[!] Not enough arguments: Use resources <SITE> <VO>
+    Example: $0 resources ILM-LCG2 training.egi.eu
+"
+ERR_SETUP_MSG="
+[!] Not enough arguments: Use setup <SITE> <VO>
+    Example: $0 setup ILM-LCG2 training.egi.eu
+"
+ERR_TF_MSG="
+[!] Not enough arguments: Use tf <SITE> <VO> <TERRAFORM_COMMAND>
+    Example: $0 tf ILM-LCG2 training.egi.eu apply
+"
+# ------------------------------------------------------------------------
+# Functions
+# ------------------------------------------------------------------------
+parse_arguments () {
+    if [ $# -eq 0 ]; then
+        print_help
+    fi
+
+    while [[ "$#" -gt 0 ]]; do case $1 in
+        install*) install;exit;;
+        setup*) setup $2 $3;exit;;
+        list*) list_providers_vos;exit;;
+        resources*) create_variables $2 $3;exit;;
+        tf) shift; call_terraform "$@";exit;;
+        *) print_help;exit;;
+    esac; done
+}
+
+print_help () {
+    echo
+    echo
+    echo "    .d888              888          888                        888        888     .d888 "
+    echo "   d88P\"               888          888                        888        888    d88P\"  "
+    echo "   888                 888          888                        888        888    888    "
+    echo "   888888 .d88b.   .d88888  .d8888b 888  .d88b.  888  888  .d88888        888888 888888 "
+    echo "   888   d8P  Y8b d88\" 888 d88P\"    888 d88\"\"88b 888  888 d88\" 888        888    888    "
+    echo "   888   88888888 888  888 888      888 888  888 888  888 888  888 888888 888    888    "
+    echo "   888   Y8b.     Y88b 888 Y88b.    888 Y88..88P Y88b 888 Y88b 888        Y88b.  888    "
+    echo "   888    \"Y8888   \"Y88888  \"Y8888P 888  \"Y88P\"   \"Y88888  \"Y88888         \"Y888 888    "
+    echo
+    echo
+    echo "                                  ============="
+    echo "                                   FEDCLOUD-TF"
+    echo "                                  ============="
+    echo "               Script to support Terraform use on Fedcloud infrastructure"
+    echo
+    echo    
+    echo " Version: $VERSION"
+    echo " Contact: EGI Foundation. Ignacio Lamata Martinez (ignacio.lamata@egi.eu)"
+    echo
+    echo
+    echo " Arguments"
+    echo " ---------"
+    echo
+    echo " install                 Installs the software needed to use Terraform in the EGI"
+    echo "                         infrastructure. This installation consists of OIDC-agent"
+    echo "                         and Fedcloud. "
+    echo "                         OIDC-agent will require you to log in into your Check-in"
+    echo "                         account (this is a one-time process)."
+    echo "                         To install Fedcloud you will need to have Python already"
+    echo "                         installed."
+    echo
+    echo
+    echo " list                    Lists the providers and VOs available for the user."
+    echo
+    echo
+    echo " resources <site> <vo>   Creates a file of Terraform variables containing all possible"
+    echo "                         images and flavours available for use at the specified provider."
+    echo "                         Note that the file is named after the site and vo and is"
+    echo "                         overwritten if it exists."
+    echo
+    echo
+    echo " setup <site> <vo>       Outputs the export of variables \"OS_AUTH_URL\" and \"OS_TOKEN\""
+    echo "                         containing the provider endpoint and a requested token."
+    echo "                         This should normally be used with eval (see example below)."
+    echo
+    echo
+    echo " tf <site> <vo> *        Configures the endpoint and token and runs terraform with any"
+    echo "                         argument supplied after the <vo> argument (see example below)."
+    echo
+    echo
+    echo
+    echo " Operation"
+    echo " ---------"
+    echo " The usual way to use this script is:"
+    echo " - Run \"$0 install\" to have all components installed. This has to be done only once."
+    echo " - Run \"$0 list\" anytime you need to see which providers and VOs you can use."
+    echo "   Once you know the site name and VO name you do not need to run this command again."
+    echo " - With the site and VO names, run \"$0 resources <site> <vo>\" to have a file with"
+    echo "   Terraform variables created for you. Open this file and obtain the IDs that you"
+    echo "   wish to use in your Terraform scripts. You only need to run this command again"
+    echo "   if the site has new or updated images or if you want to access another site or VO."
+    echo "   Note that all these variable files will be automatically loaded by Terraform if they"
+    echo "   are in your current directory."
+    echo " - To run Terraform, you have two options:"
+    echo "   a) Run \"eval \`$0 setup <site> <vo>\`\" first and then run your Terraform commands"
+    echo "      as usual. The eval command requests an access token that is normally valid for one hour,"
+    echo "      so it will have to be run again anytime you use Terraform and the token is expired."
+    echo "   b) Run Terraform through \"$0 tf <site> <vo> <Terraform_parameters>\". This automatically"
+    echo "      requests a new access token every time and calls terraform with any parameter supplied."
+    echo
+    echo
+    echo
+    echo " Usage examples"
+    echo " ---------------"
+    echo " $0 install"
+    echo " Installs the required components"
+    echo
+    echo " $0 list"
+    echo " Outputs the list of providers and VOs available for your user"
+    echo
+    echo " $0 resources PROV vo.access.egi.eu"
+    echo " Generates the file \"PROV-vo.access.egi.eu.tf\" (overwriting contents!)"
+    echo " containing Terraform variables for a specific provider, which can be"
+    echo " referenced from your Terraform files."
+    echo
+    echo " eval \`$0 setup PROV vo.access.egi.eu\`"
+    echo " Configures the access to a provider with the environment variables"
+    echo " \"OS_AUTH_URL\" and \"OS_TOKEN\" used by Terraform. After this,"
+    echo " you can run your Terraform commands as usual."
+    echo " This command requests a token that will typically last for 1h."
+    echo " The command will have to be run again if the token is expired."
+    echo
+    echo " $0 tf PROV vo.access.egi.eu apply"
+    echo " Runs a terraform apply, after requesting a token from a provider."
+    echo " This is an alternative to using the \"$0 setup\" command, as it"
+    echo " basically runs a setup command internally and then calls the"
+    echo " \"terraform\" command with any additional parameters."
+    echo
+    echo " $0 tf PROV vo.access.egi.eu apply -var-file=\"testing.tfvars\""
+    echo " Runs a terraform apply -var-file=\"testing.tfvars\"."    
+    echo
+    echo
+    echo
+    exit
+}
+
+
+# ------------------------------------------------------------------------
+# verify_system: checks that apt is installed (e.g. Ubuntu or Debian)
+# ------------------------------------------------------------------------
+verify_system () {
+    apt -v >/dev/null 2>&1
+    APT_RET=$?
+    if [ $APT_RET -ne 0 ]; then
+        echo "  [!] The system does not seem to use APT, which is needed for installation. Exiting..."
+        exit $ERR_NOAPTSYSTEM_VALUE
+    fi
+}
+
+
+# ------------------------------------------------------------------------
+# check_numberof_parameters: verify at least the number of parameters specified in $1 are provided,
+#                            otherwise it shows error message defined in $2
+# ------------------------------------------------------------------------
+check_numberof_parameters () {
+    NR_PARAM=$1
+    ERR_MSG=$2
+    shift; shift
+    if [[ "$#" -lt $NR_PARAM ]]; then
+        echo "$ERR_MSG"
+        exit $ERR_INCORRECTPARAMETERS_VALUE
+    fi
+}
+
+
+# ------------------------------------------------------------------------
+# install_oidc: installs oidc-agent if it has not been already installed
+# ------------------------------------------------------------------------
+install_oidc () {
+    read -n1 -p "  > oidc-agent will be installed. Continue? ('no' will skip) [y/n]: " -es answer
+    if [ "$answer" = "y" ]; then
+        PKG_NAME=oidc-agent
+        if dpkg --get-selections | grep -q "^$PKG_NAME[[:space:]]*install$" >/dev/null ; then
+            echo "  [!] $PKG_NAME seems to have been already installed. Skipping installation..."
+        else
+            echo a
+            sudo sh -c "curl -N repo.data.kit.edu/repo-data-kit-edu-key.gpg | gpg   --dearmor  > /usr/share/keyrings/kitrepo-archive.gpg"
+            sudo sh -c "echo 'deb [signed-by=/usr/share/keyrings/kitrepo-archive.gpg]   https://repo.data.kit.edu/debian/testing ./' >> /etc/apt/sources.list"
+            sudo apt update
+            sudo apt install $PKG_NAME -y
+            eval `oidc-keychain`
+            oidc-gen --pub --issuer https://aai.egi.eu/oidc \
+                         --scope "email \
+                         eduperson_entitlement \
+                         eduperson_scoped_affiliation \
+                         eduperson_unique_id" $OIDC_ACCOUNT_NAME
+            configure_oidc_account
+        fi
+    else
+        echo "    Skipping installation as instructed by user"
+    fi
+}
+
+
+# ------------------------------------------------------------------------
+# configure_oidc_account: prepares the OIDC environment
+# ------------------------------------------------------------------------
+configure_oidc_account () {
+    eval `oidc-keychain` >/dev/null
+    export OIDC_AGENT_ACCOUNT=$OIDC_ACCOUNT_NAME
+}
+
+
+# ------------------------------------------------------------------------
+# install_fedcloud: installs fedcloud if it has not been already installed
+# ------------------------------------------------------------------------
+install_fedcloud () {
+    read -n1 -p "  > fedcloudclient and python3-pip will be installed. Continue? ('no' will skip) [y/n]: " -es answer
+    if [ "$answer" = "y" ]; then
+        PKG_NAME=fedcloudclient
+        if pip list | grep fedcloudclient >/dev/null ; then
+            echo "  [!] $PKG_NAME seems to have been already installed. Skipping installation..."
+        else
+            sudo apt install python3-pip -y
+            pip install -U $PKG_NAME
+        fi
+    else
+        echo "    Skipping installation as instructed by user"
+    fi
+}
+
+
+# ------------------------------------------------------------------------
+# install_openstack: installs openstack client if it has not been already installed
+# ------------------------------------------------------------------------
+install_openstack () {
+    read -n1 -p "  > Openstack Python client will be installed. Continue? ('no' will skip) [y/n]: " -es answer
+    if [ "$answer" = "y" ]; then
+        PKG_NAME=python3-openstackclient
+        if dpkg --get-selections | grep -q "^$PKG_NAME[[:space:]]*install$" >/dev/null ; then
+            echo "  [!] $PKG_NAME seems to have been already installed. Skipping installation..."
+        else
+            sudo apt install python3-openstackclient -y
+        fi
+    else
+        echo "    Skipping installation as instructed by user"
+    fi
+}
+
+
+# ------------------------------------------------------------------------
+# install_provider_certificates: installs certificates for providers using their own CA
+# ------------------------------------------------------------------------
+install_provider_certificates () {
+    read -n1 -p "  > The certificates to access Fedcloud providers will be installed. Continue? ('no' will skip) [y/n]: " -es answer
+    if [ "$answer" = "y" ]; then
+        echo Not implemented yet
+    else
+        echo "    Skipping installation as instructed by user"
+    fi
+}
+
+
+# ------------------------------------------------------------------------
+# install: installs required components: oidc-agent and fedcloud
+# ------------------------------------------------------------------------
+install () {
+    verify_system
+    echo
+    echo Installing oidc-agent...
+    install_oidc
+    echo
+    echo Installing fedcloud client...
+    install_fedcloud
+    echo
+    echo Installing openstack client...
+    install_openstack
+    echo
+    echo Installing provider certificates...
+    install_provider_certificates
+    exit $OK_VALUE
+}
+
+
+# ------------------------------------------------------------------------
+# list_providers_vos: obtains information about available sites and VOs
+# ------------------------------------------------------------------------
+list_providers_vos () {
+    configure_oidc_account
+    $FEDCLOUDCLI_PATH endpoint vos -a
+    exit $?
+}
+
+
+# ------------------------------------------------------------------------
+# create_variables: collects information about resources
+# ------------------------------------------------------------------------
+create_variables () {
+    check_numberof_parameters 2 "$ERR_RESOURCES_MSG" $1 $2
+    SITE=$1
+    VO=$2
+
+    configure_oidc_account
+    mapfile -t images_array < <($FEDCLOUDCLI_PATH openstack image list --site $SITE --vo $VO -c ID -c Name -c Status -f csv 2>/dev/null | grep \"active\" | cut -d, -f1,2)
+    mapfile -t flavours_array < <($FEDCLOUDCLI_PATH openstack flavor list --site $SITE --vo $VO -c ID -c Name -c RAM -c Disk -c VCPUs -c 'Is Public' -f csv 2>/dev/null | grep ,True | cut -d, -f1,2,3,4,5)
+
+    LOCALS_FILE_NAME=$SITE.$VO.tf
+    if [ ${#images_array[@]} -eq 0 ]; then
+        echo " [!] No data for SITE: [$SITE] at VO: [$VO]"
+        RETVALUE=$ERR_NODATA_VALUE
+    else
+        echo "locals {" > $LOCALS_FILE_NAME
+        for image in "${images_array[@]}"
+        do
+            EGIVALUE=`echo $image | cut -d\" -f2`
+            EGIID=img-`echo $EGIVALUE | md5sum`
+            EGICOMMENT=`echo $image | cut -d\" -f4`
+            echo "  ${EGIID:0:9} = \"$EGIVALUE\" # $EGICOMMENT" >> $LOCALS_FILE_NAME
+        done
+        EGIVALUE=
+        EGIID=
+        EGICOMMENT=
+        echo "  # ---------" >> $LOCALS_FILE_NAME
+        for flavour in "${flavours_array[@]}"
+        do
+            EGIVALUE=`echo $flavour | cut -d\" -f2`
+            EGIID=flv-`echo $EGIVALUE | md5sum`
+            EGICOMMENT=`echo $flavour | cut -d\" -f4`
+            EGICOMMENT="$EGICOMMENT [CPU] `echo $flavour | cut -d, -f5` [RAM] `echo $flavour | cut -d, -f3` [DISK] `echo $flavour | cut -d, -f4`"
+            echo "  ${EGIID:0:9} = \"$EGIVALUE\" # $EGICOMMENT" >> $LOCALS_FILE_NAME
+        done
+        echo "}" >> $LOCALS_FILE_NAME
+        echo Variables created in file [$LOCALS_FILE_NAME]
+        RETVALUE=$OK_VALUE
+    fi
+    exit $RETVALUE
+}
+
+
+# ------------------------------------------------------------------------
+# get_provider_endpoint: finds out the endpoint to access the provider
+# ------------------------------------------------------------------------
+get_provider_endpoint () {
+    export SITE_ENDPOINT=`$FEDCLOUDCLI_PATH endpoint list --site $1 | grep http | tr -s ' ' | cut -d' ' -f3`
+    if [ -z $SITE_ENDPOINT ]; then
+        echo " [!] Error collecting endpoint address for site [$1]"
+        exit $ERR_ENDPOINTREQ_VALUE
+    fi
+}
+
+
+# ------------------------------------------------------------------------
+# request_provider_token: request an Openstack token to access the provider
+# ------------------------------------------------------------------------
+request_provider_token () {
+    export SITE_TOKEN=`$FEDCLOUDCLI_PATH openstack --site $1 --vo $2 token issue -c id -f value 2>/dev/null`
+    if [ -z $SITE_TOKEN ]; then
+        echo " [!] Error requesting token for site [$1] at VO [$2]"
+        exit $ERR_TOKENREQ_VALUE
+    fi
+}
+
+
+# ------------------------------------------------------------------------
+# setup: configures the access to a site and VO by outputing the endpoint URL
+#        and requesting an access token from the provider
+# ------------------------------------------------------------------------
+setup () {
+    check_numberof_parameters 2 "$ERR_SETUP_MSG" $1 $2
+    SITE=$1
+    VO=$2
+
+    configure_oidc_account
+
+    get_provider_endpoint $SITE
+    echo "export OS_AUTH_URL=\"$SITE_ENDPOINT\""
+
+    request_provider_token $SITE $VO
+    echo "export OS_TOKEN=\"$SITE_TOKEN\""
+
+    exit $OK_VALUE
+}
+
+
+# ------------------------------------------------------------------------
+# call_terraform: retrieves token and executes terraform with the specified parameters
+# ------------------------------------------------------------------------
+call_terraform () {
+    check_numberof_parameters 3 "$ERR_TF_MSG" $1 $2 $3
+    SITE=$1
+    VO=$2
+
+    configure_oidc_account
+    get_provider_endpoint $SITE
+    export OS_AUTH_URL="$SITE_ENDPOINT"
+    request_provider_token $SITE $VO
+    export OS_TOKEN="$SITE_TOKEN"
+    shift;shift
+    terraform $@
+    exit $?
+}
+
+
+# ------------------------------------------------------------------------
+# MAIN
+# ------------------------------------------------------------------------
+main () {
+    parse_arguments "$@"
+}
+
+main "$@"
